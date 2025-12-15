@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  # --- CAJA 1: BASE DE DATOS LOCAL (PostgreSQL) ---
+  db:
+    image: postgres:15
+    container_name: postgres_pizzeria
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: PasswordSeguro123
+      POSTGRES_DB: pizzeria_db
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # --- CAJA 2: TU BOT ---
+  bot:
+    build: ./backend
+    container_name: bot_pizzeria
+    restart: always
+    ports:
+      - "4000:4000"
+    environment:
+      # Conexión interna directa a la Caja 1 (db)
+      DATABASE_URL: "postgresql://postgres:PasswordSeguro123@db:5432/pizzeria_db?sslmode=disable"
+      
+      # TUS CLAVES REALES
+      WHATSAPP_VERIFY_TOKEN: "pumpuchacuna1212"
+      WHATSAPP_ACCESS_TOKEN: "EAAWk1LywTJIBQHh4rPXZBZAaCcKTfXMheNCdSlmRRZA5LnlqMZCxXn3mprfZCLaa4PWlS3vtmesSrioZCWZBV1MEYAc5bNhj7r7oVC49TDDlv9mS1hHWW71fOBSuQCVboZBhGs8lXJxn2nqEtWFoRjL0zTsOkNb48MOYQEz5iZBym1rS6zkHZCjcemBkvejhGg"
+      WHATSAPP_PHONE_ID: "911474142044973"
+      META_APP_ID: "1588608489245842"
+      META_APP_SECRET: "99530a606c211beb09d34857da6d19e0"
+      GEMINI_API_KEY: "AIzaSyDOJgLQ1-U5HWudr2ecuhEyoiBCd8_u8Ko"
+      
+      # Configuración técnica
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      PORT: "4000"
+    depends_on:
+      - db
+
+volumes:
+  pg_data:
