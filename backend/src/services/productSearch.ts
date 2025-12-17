@@ -1,4 +1,5 @@
-import { MENU, MenuCategory, MenuItem } from '../data/menu';
+import { MenuCategory, MenuItem } from '../data/menu';
+import { getMenuCached } from './menuCache';
 import { bestFuzzyMatch, levenshtein, normalizeText, similarityRatio, tokenize } from '../utils/fuzzyMatch';
 
 const STOPWORDS = new Set([
@@ -94,6 +95,23 @@ const SIZE_SYNONYMS: Record<string, string[]> = {
 
 const filteredTokens = (text: string) => tokenize(text).filter((token) => !STOPWORDS.has(token));
 
+const ALIAS_MAP: Record<string, string> = {
+  lasana: 'lasagna',
+  lasagna: 'lasagna',
+  lasagnas: 'lasagna',
+  lasanas: 'lasagna'
+};
+
+const applyAliases = (tokens: string[]) => tokens.map((t) => ALIAS_MAP[t] ?? t);
+
+const normalizeAndFilterTokens = (value: string | string[]) => {
+  const raw = Array.isArray(value) ? value.join(' ') : value;
+  const tokens = tokenize(raw);
+  const withAliases = applyAliases(tokens);
+  const filtered = withAliases.filter((t) => t && !STOPWORDS.has(t));
+  return Array.from(new Set(filtered)); // dedupe
+};
+
 export const detectSizeFromText = (text: string, sizeOptions: string[]) => {
   const normalized = normalizeText(text);
   for (const option of sizeOptions) {
@@ -114,13 +132,14 @@ export interface ProductMatch {
   ratio: number;
 }
 
-export const findProductMatch = (text: string): ProductMatch | null => {
+export const findProductMatch = async (text: string): Promise<ProductMatch | null> => {
   const normalized = normalizeText(text);
   if (!normalized) return null;
 
+  const menu = await getMenuCached();
   const match = bestFuzzyMatch(
     normalized,
-    MENU,
+    menu,
     (item) => [`${item.name} ${item.description} ${item.id.replace(/_/g, ' ')}`]
   );
 
@@ -215,9 +234,9 @@ export interface SearchCriteria {
   exclude?: string[];
 }
 
-export const searchMenu = (criteria: SearchCriteria) => {
+export const searchMenu = async (criteria: SearchCriteria) => {
   console.log('🔍 INICIO BÚSQUEDA:', JSON.stringify(criteria));
-  let results = MENU;
+  let results = await getMenuCached();
   console.log(`📊 Total ítems iniciales: ${results.length}`);
 
   if (criteria.category) {
@@ -242,15 +261,36 @@ export const searchMenu = (criteria: SearchCriteria) => {
   }
 
   if (criteria.query) {
-    const q = normalizeText(criteria.query);
-    console.log(`   🔎 Buscando query normalizada '${q}'`);
+    const queryTokens = normalizeAndFilterTokens(criteria.query);
+    console.log(`   🔎 Tokens de búsqueda '${queryTokens.join(', ')}'`);
     const beforeQueryCount = results.length;
-    results = results.filter((item) => {
-      const keywordsText = (item.keywords || []).join(' ');
-      const text = normalizeText(`${item.name} ${item.description} ${keywordsText}`);
-      return text.includes(q);
+    const matchesByTokens = results.filter((item) => {
+      const candidateTokens = normalizeAndFilterTokens([
+        item.name,
+        ...(item.keywords || [])
+      ]);
+      // AND: cada token de la query debe estar en name/keywords
+      return queryTokens.every((qt) => candidateTokens.includes(qt));
     });
-    console.log(`   ➡️ Tras filtro query '${q}': ${results.length}/${beforeQueryCount} ítems`);
+
+    if (matchesByTokens.length > 0) {
+      results = matchesByTokens;
+      console.log(`   ➡️ Coincidencias exactas por tokens: ${results.length}/${beforeQueryCount} ítems`);
+    } else {
+      console.log('   ⚠️ Sin coincidencias exactas, probando búsqueda difusa...');
+      const best = bestFuzzyMatch(
+        criteria.query,
+        results,
+        (item) => [item.name, item.description, ...(item.keywords || [])]
+      );
+      if (best && best.score > 0 && best.ratio >= 0.2) {
+        results = [best.item];
+        console.log(`   ✅ Fallback difuso: '${best.item.name}' (score:${best.score}, ratio:${best.ratio.toFixed(2)})`);
+      } else {
+        results = [];
+        console.log('   ❌ Sin resultados incluso con difuso.');
+      }
+    }
   }
 
   console.log(`✅ RESULTADO FINAL: ${results.length} ítems encontrados.`);

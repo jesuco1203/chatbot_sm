@@ -1,45 +1,39 @@
-import { GoogleGenAI, FunctionCall } from '@google/genai';
+import OpenAI from 'openai';
 import { loadEnv } from '../config/environment';
 import { toolDeclarations, searchMenuTool } from './tools';
 import { getSystemInstruction, WELCOME_MESSAGE } from './instructions';
 import { sessionManager, UserSession } from '../services/sessionManager';
-import { getItemById, MenuCategory } from '../data/menu';
+import { getItemById, MenuCategory, getItemsByCategory } from '../data/menu';
 import { createOrder, getLastOrderStatus } from '../services/orderService';
 import { getUserByPhone, upsertUser } from '../services/userService';
 import { sendWhatsappMessage } from '../services/whatsappService';
 import { detectCategoryFromText, searchMenu } from '../services/productSearch';
+import { parseAddress, stringifyAddress } from '../utils/address';
+import { calculateDistance } from '../utils/geo';
+import { deepseekClient, defaultDeepseekModel } from '../llm/deepseekClient';
 
 const env = loadEnv();
-const aiClient = new GoogleGenAI({ apiKey: env.geminiApiKey });
 
-type ChatSession = ReturnType<typeof aiClient.chats.create>;
-
-const chatSessions = new Map<string, ChatSession>();
-
-const getChatSession = (phone: string, previousHistory: any[] = []) => {
-  if (!chatSessions.has(phone)) {
-    const session = aiClient.chats.create({
-      model: 'gemini-2.5-flash',
-      config: {
-        systemInstruction: getSystemInstruction(),
-        tools: [{ functionDeclarations: toolDeclarations }],
-        temperature: 0.5
-      },
-      history: previousHistory
-    });
-    chatSessions.set(phone, session);
-  }
-  return chatSessions.get(phone)!;
+const buildDeliveryFromLocation = (lat: number, lng: number) => {
+  const restaurantLocation = { latitude: env.restaurantLatitude, longitude: env.restaurantLongitude };
+  const customerLocation = { latitude: lat, longitude: lng };
+  const distance = calculateDistance(restaurantLocation, customerLocation);
+  const rawCost = distance * env.deliveryRatePerKm;
+  const cost = Math.max(rawCost, 3);
+  return { location: customerLocation, distance, cost };
 };
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const sendMessageWithRetry = async (chatSession: ChatSession, payload: any, attempts = 0): Promise<any> => {
+const sendMessageWithRetry = async (
+  payload: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+  attempts = 0
+): Promise<OpenAI.Chat.Completions.ChatCompletion> => {
   const maxAttempts = 3;
   try {
-    return await chatSession.sendMessage(payload);
+    return await deepseekClient.chat.completions.create(payload);
   } catch (error: any) {
-    console.error('>>> GEMINI ERROR:', error);
+    console.error('>>> LLM ERROR:', error);
     const shouldRetry =
       attempts + 1 < maxAttempts &&
       (
@@ -53,7 +47,7 @@ const sendMessageWithRetry = async (chatSession: ChatSession, payload: any, atte
 
     if (shouldRetry) {
       await delay(2000 * (attempts + 1));
-      return sendMessageWithRetry(chatSession, payload, attempts + 1);
+      return sendMessageWithRetry(payload, attempts + 1);
     }
     throw error;
   }
@@ -73,7 +67,7 @@ interface ToolExecutionResult {
 }
 
 const handleAddToCart = async (phone: string, args: Record<string, any>): Promise<ToolExecutionResult> => {
-  const product = getItemById(args.itemId);
+  const product = await getItemById(args.itemId);
   if (!product) {
     return { response: JSON.stringify({ status: 'error', message: 'Producto no encontrado.' }) };
   }
@@ -116,7 +110,7 @@ const handleRemoveFromCart = async (phone: string, args: Record<string, any>): P
   const itemToRemove = session.cart.find(item => item.id.toLowerCase() === targetId);
 
   if (itemToRemove) {
-    await sessionManager.removeFromCart(phone, itemToRemove.id);
+    await sessionManager.removeFromCart(phone, itemToRemove.id, session);
     return {
       response: JSON.stringify({
         status: 'success',
@@ -137,9 +131,25 @@ const handleRemoveFromCart = async (phone: string, args: Record<string, any>): P
 
 const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> => {
   const session = await sessionManager.getSession(phone);
-  const { name, address } = session;
+  const { name, address, orderAddress, delivery } = session;
 
-  if (!name || !address) {
+  if (session.pendingAddressChange) {
+    const needsAddress = !session.pendingAddressChange.addressText;
+    const needsChoice = session.pendingAddressChange.awaitingChoice;
+    const needsLocation = !session.pendingAddressChange.location;
+    if (needsAddress || needsChoice || needsLocation) {
+      return {
+        response: JSON.stringify({
+          status: 'pending_address',
+          message: 'Falta cerrar el cambio de dirección: dirección, ubicación y confirmación de uso.'
+        })
+      };
+    }
+  }
+
+  const finalAddressText = orderAddress || address;
+
+  if (!name || !finalAddressText) {
     return {
       response: JSON.stringify({
         status: 'pending_data',
@@ -147,6 +157,17 @@ const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> =
       })
     };
   }
+
+  // --- NUEVA VALIDACIÓN DE DELIVERY ---
+  if (!delivery || !delivery.cost) {
+    return {
+      response: JSON.stringify({
+        status: 'pending_delivery',
+        message: 'Falta calcular el costo de envío. Por favor, pide al usuario que comparta su ubicación (Location) para calcular la distancia y el costo exacto antes de confirmar.'
+      })
+    };
+  }
+  // ------------------------------------
 
   if (session.cart.length === 0) {
     return {
@@ -157,7 +178,10 @@ const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> =
     };
   }
 
-  const total = session.cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
+  const cartTotal = session.cart.reduce((acc, item) => acc + item.price * item.quantity, 0);
+  const deliveryCost = delivery.cost; // Ya validado arriba
+  const total = cartTotal + deliveryCost;
+
   const orderItems = session.cart.map((item) => ({
     productId: item.id,
     productName: item.name,
@@ -169,15 +193,27 @@ const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> =
   const summaryLines = session.cart.map(
     (item) => `• ${item.quantity}x ${item.name} (${currency.format(item.price * item.quantity)})`
   );
+  
+  // Agregar línea de Delivery
+  summaryLines.push(`📦 Delivery: ${currency.format(deliveryCost)}`);
+
   const totalLine = `💰 Total: ${currency.format(total)}`;
-  const addressLine = address ? `📍 Entrega: ${address}` : '';
+  const finalAddress = orderAddress || address;
+  const addressLine = finalAddress ? `📍 Entrega: ${finalAddress}` : '';
   const nameLine = name ? `👤 Cliente: ${name}` : '';
+
+  const addressPayload = stringifyAddress({
+    text: finalAddressText ?? '',
+    location: delivery?.location
+      ? { lat: delivery.location.latitude, lng: delivery.location.longitude }
+      : null
+  });
 
   // Asegurar que el usuario exista antes de crear la orden (FK en orders)
   await upsertUser({
     phoneNumber: phone,
     name,
-    address,
+    address: addressPayload,
     email: null
   });
 
@@ -209,6 +245,7 @@ const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> =
       orderId: order.orderId,
       orderCode: order.orderCode,
       total,
+      deliveryCost,
       summary: session.cart.map((item) => ({
         name: item.name,
         quantity: item.quantity,
@@ -221,7 +258,10 @@ const handleConfirmOrder = async (phone: string): Promise<ToolExecutionResult> =
   };
 };
 
-const executeToolCall = async (phone: string, call: FunctionCall): Promise<ToolExecutionResult> => {
+const executeToolCall = async (
+  phone: string,
+  call: { name: string; args: Record<string, any>; id?: string }
+): Promise<ToolExecutionResult> => {
   switch (call.name) {
     case 'showCart':
       return { response: JSON.stringify({ status: 'success' }), meta: { showCart: true } };
@@ -254,12 +294,68 @@ const executeToolCall = async (phone: string, call: FunctionCall): Promise<ToolE
       return handleRemoveFromCart(phone, call.args || {});
     case 'setDeliveryDetails':
       if (call.args) {
-        await sessionManager.setDeliveryDetails(phone, call.args.name as string, call.args.address as string);
+        const session = await sessionManager.getSession(phone);
+        await sessionManager.setDeliveryDetails(phone, call.args.name as string, call.args.address as string, session);
         return { response: JSON.stringify({ status: 'success' }), meta: { deliveryUpdated: true } };
       }
       return { response: JSON.stringify({ status: 'error', message: 'Missing arguments' }) };
     case 'confirmOrder':
       return handleConfirmOrder(phone);
+    case 'addMixedPizza': {
+      const session = await sessionManager.getSession(phone);
+      const { flavorA, flavorB, size } = call.args || {};
+      if (!flavorA || !flavorB || !size) {
+        return { response: JSON.stringify({ status: 'error', message: 'Faltan datos para la pizza mixta.' }) };
+      }
+      const menuConcat = (await getItemsByCategory('pizza'));
+      const p1 = menuConcat.find((p) => p.name.toLowerCase() === String(flavorA).toLowerCase());
+      const p2 = menuConcat.find((p) => p.name.toLowerCase() === String(flavorB).toLowerCase());
+      if (!p1 || !p2) {
+        return { response: JSON.stringify({ status: 'error', message: 'No se encontraron ambos sabores.' }) };
+      }
+      if (!['Grande', 'Familiar'].includes(size)) {
+        return { response: JSON.stringify({ status: 'error', message: 'Tamaño inválido para pizza mixta.' }) };
+      }
+      const priceA = p1.prices[size];
+      const priceB = p2.prices[size];
+      if (priceA === undefined || priceB === undefined) {
+        return { response: JSON.stringify({ status: 'error', message: 'Alguno de los sabores no tiene precio para ese tamaño.' }) };
+      }
+      const mixedPrice = Math.max(priceA, priceB);
+      const name = `Pizza Mixta (${p1.name} / ${p2.name})`;
+      await sessionManager.addToCart(phone, { id: `mixed_${p1.id}_${p2.id}_${size}`, name, price: mixedPrice }, 1, session);
+      return {
+        response: JSON.stringify({
+          status: 'success',
+          message: `Añadí 1x ${name} (${size}) a tu carrito.`
+        }),
+        meta: { cartUpdated: true }
+      };
+    }
+    case 'startCheckout': {
+      const session = await sessionManager.getSession(phone);
+      const needsName = !session.name;
+      if (needsName) {
+        return {
+          response: JSON.stringify({
+            status: 'need_name',
+            message: 'Para generar tu pedido, primero necesito tu Nombre Completo. ¿Cómo te llamas?'
+          })
+        };
+      }
+      const finalAddress = session.orderAddress || session.address;
+      const needsAddress = !finalAddress;
+      const needsLocation = !session.delivery?.location;
+      if (needsAddress || needsLocation) {
+        return {
+          response: JSON.stringify({
+            status: 'need_address',
+            message: `¡Gracias ${session.name}! Ahora necesito saber dónde entregarlo. Por favor escribe tu dirección y comparte tu ubicación (Maps) para calcular el delivery.`
+          })
+        };
+      }
+      return { response: JSON.stringify({ status: 'ready', message: 'Checkout listo' }), meta: { showCart: true } };
+    }
     case 'checkOrderStatus': {
       const lastOrder = await getLastOrderStatus(phone);
       if (!lastOrder) {
@@ -294,6 +390,7 @@ export interface NaturalMessageResult {
   handled: boolean;
   showCart?: boolean;
   needsFallback?: boolean;
+  stopConversation?: boolean;
 }
 
 const buildStateContext = (session: UserSession) => {
@@ -306,7 +403,7 @@ const buildStateContext = (session: UserSession) => {
       }`
     );
   } else {
-    lines.push('Cliente nuevo detectado. Solicita nombre completo y dirección antes de confirmar.');
+    lines.push('Cliente nuevo o con datos incompletos. Toma el pedido con tools, y pide nombre/dirección/ubicación solo al preparar el checkout/confirmación.');
   }
 
   if (session.cart.length > 0) {
@@ -361,7 +458,12 @@ export const processNaturalMessage = async (
         session.name = existingUser.name;
       }
       if (existingUser.address && !session.address) {
-        session.address = existingUser.address;
+        const meta = parseAddress(existingUser.address);
+        session.address = meta.text || existingUser.address;
+        if (meta.location) {
+          const deliveryData = buildDeliveryFromLocation(meta.location.lat, meta.location.lng);
+          session.delivery = deliveryData;
+        }
       }
       sessionSnapshot = session;
       await sessionManager.updateSession(phone, session);
@@ -369,12 +471,6 @@ export const processNaturalMessage = async (
   } catch (err) {
     console.error('>>> USER LOOKUP ERROR:', err);
   }
-
-  const geminiHistory = (sessionSnapshot.history || []).map((h) => ({
-    role: h.role === 'assistant' ? 'model' : 'user',
-    parts: h.parts
-  }));
-  const chat = getChatSession(phone, geminiHistory);
 
   const context = buildStateContext(sessionSnapshot);
   let augmentedText = '';
@@ -408,32 +504,99 @@ ${debugInfo}
     augmentedText = `Número detectado: +${phone}\n${context}\n\nUsuario dice: ${text}`;
   }
 
-  console.log('🤖 [GEMINI] 🧠 Analizando contexto...');
-  // console.log(augmentedText); // Descomenta si quieres ver TODO el prompt (mucho texto)
-  let result = await sendMessageWithRetry(chat, { message: [{ text: augmentedText }] });
-  console.log('\n╔══════════════════════════════════════════════════╗');
-  console.log('║ 🤖 GEMINI DECISIÓN                               ║');
-  if (result.text) {
-  console.log(`║ 🗣️  Respuesta: "${result.text.replace(/\\n/g, ' ').substring(0, 50)}..."`);
-  }
-  
-  if (result.functionCalls && result.functionCalls.length > 0) {
-      console.log('║ 🛠️  TOOLS INVOCADAS:                             ║');
-      result.functionCalls.forEach((fc: any) => {
-          console.log(`║    👉 ${fc.name.padEnd(15)} Args: ${JSON.stringify(fc.args)}`);
-      });
-  } else {
-      console.log('║ ⏩  (Sin herramientas)                           ║');
-  }
-  console.log('╚══════════════════════════════════════════════════╝\n');
+  const historyMessages = (sessionSnapshot.history || []).map((h) => {
+    const parts = Array.isArray(h.parts) ? h.parts : [];
+    const content = parts.map((p: any) => p?.text ?? '').join('\n');
+    return {
+      role: h.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+      content
+    };
+  });
 
+  const baseMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: getSystemInstruction().replace('{{USER_ADDRESS}}', sessionSnapshot.orderAddress || sessionSnapshot.address || 'Not set') },
+    ...historyMessages,
+    { role: 'user', content: augmentedText }
+  ];
+
+  const extractText = (content: any) => {
+    if (!content) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((part: any) => {
+          if (typeof part === 'string') return part;
+          return part?.text ?? '';
+        })
+        .join('');
+    }
+    return '';
+  };
+
+  console.log('🤖 [LLM] 🧠 Analizando contexto con DeepSeek...');
+  let completion = await sendMessageWithRetry({
+    model: defaultDeepseekModel,
+    messages: baseMessages,
+    tools: toolDeclarations as any,
+    tool_choice: 'auto',
+    temperature: sessionSnapshot.isDevMode ? 0 : 0.5
+  });
+
+  const firstChoice = completion.choices?.[0];
+  if (!firstChoice) {
+    throw new Error('LLM sin opciones de respuesta');
+  }
+  let message = firstChoice.message;
   let stopConversation = false;
-  while (result.functionCalls && result.functionCalls.length > 0) {
+
+  const logDecision = (msg: OpenAI.Chat.Completions.ChatCompletionMessage) => {
+    const preview = extractText(msg.content).replace(/\n/g, ' ').substring(0, 50);
+    console.log('\n╔══════════════════════════════════════════════════╗');
+    console.log('║ 🤖 LLM DECISIÓN                                  ║');
+    if (preview) console.log(`║ 🗣️  Respuesta: "${preview}..."`);
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      console.log('║ 🛠️  TOOLS INVOCADAS:                             ║');
+      (msg.tool_calls as any[]).forEach((tc) => console.log(`║    👉 ${tc.function.name} Args: ${tc.function.arguments}`));
+    } else {
+      console.log('║ ⏩  (Sin herramientas)                           ║');
+    }
+    console.log('╚══════════════════════════════════════════════════╝\n');
+  };
+
+  logDecision(message);
+
+  // Revisor: por ahora aprobamos todas las tool calls para no bloquear búsquedas ni agregados.
+  const shouldExecuteToolCalls = async (_toolCalls: any[]): Promise<{ approve: boolean; reason?: string }> => {
+    return { approve: true };
+  };
+
+  while ((message.tool_calls?.length || 0) > 0) {
     botUsedTool = true;
-    console.log('>>> FUNCTION CALLS:', result.functionCalls.map((fc: any) => ({ name: fc.name, args: fc.args })));
-    const responseParts = [];
-    for (const call of result.functionCalls as FunctionCall[]) {
-      const execResult = await executeToolCall(phone, call);
+    const toolCalls: any[] = (message.tool_calls as any[]) || [];
+    console.log('>>> FUNCTION CALLS:', toolCalls.map((tc) => ({ name: tc.function.name, args: tc.function.arguments })));
+
+    const approval = await shouldExecuteToolCalls(toolCalls);
+    if (!approval.approve) {
+      replies.push(`No ejecuté las herramientas: ${approval.reason || 'rechazado'}`);
+      stopConversation = true;
+      break;
+    }
+
+    // Registrar el mensaje del asistente con las tool calls
+    baseMessages.push({
+      role: 'assistant',
+      content: extractText(message.content),
+      tool_calls: toolCalls
+    } as any);
+
+    for (const call of toolCalls) {
+      let parsedArgs: Record<string, any> = {};
+      try {
+        parsedArgs = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+      } catch {
+        parsedArgs = {};
+      }
+      const execResult = await executeToolCall(phone, { name: call.function.name, args: parsedArgs, id: call.id });
 
       if (execResult.meta?.showMenu) {
         showMenu = true;
@@ -484,34 +647,40 @@ ${debugInfo}
         sessionWasReset = true;
       }
 
-      responseParts.push({
-        functionResponse: {
-          name: call.name,
-          response: { result: execResult.response },
-          id: call.id
-        }
-      });
+      baseMessages.push({
+        role: 'tool',
+        tool_call_id: call.id || call.function?.name || 'tool_call',
+        content: execResult.response
+      } as any);
     }
 
-    // Transformar a Content[]
-    if (stopConversation || stopAfterTools) {
-      break;
-    }
-    result = await sendMessageWithRetry(chat, { message: responseParts });
-    console.log('>>> GEMINI RESPONSE (after tools):', {
-      text: result.text,
-      functionCalls: result.functionCalls?.map((fc: any) => ({ name: fc.name, args: fc.args }))
+    if (stopConversation || stopAfterTools) break;
+
+    completion = await sendMessageWithRetry({
+      model: defaultDeepseekModel,
+      messages: baseMessages,
+      tools: toolDeclarations as any,
+      tool_choice: 'auto',
+      temperature: sessionSnapshot.isDevMode ? 0 : 0.5
     });
+    const nextChoice = completion.choices?.[0];
+    if (!nextChoice) {
+      throw new Error('LLM sin opciones de respuesta');
+    }
+    message = nextChoice.message;
+    logDecision(message);
   }
+
+  const resultText = extractText(message?.content);
 
   if (pendingSizePrompt) {
     cartUpdated = false;
   }
 
-  if (!stopConversation && result.text && !pendingSizePrompt && !skipModelText && !showMenu && !categoryToShow) {
+  if (!stopConversation && resultText && !pendingSizePrompt && !skipModelText && !showMenu && !categoryToShow) {
     // Si es respuesta de confirmación final, formatear con íconos y dirección
     try {
-      const parsed = JSON.parse(result.text);
+      const parsed = JSON.parse(resultText);
       if (parsed.status === 'confirmed') {
         const currency = new Intl.NumberFormat('es-PE', { style: 'currency', currency: 'PEN' });
         const itemsLines = (parsed.summary || []).map((it: any, idx: number) => `• ${it.quantity}x ${it.name} (${currency.format(it.lineTotal)})`);
@@ -525,20 +694,10 @@ ${debugInfo}
           .join('\n');
         replies.push(formatted);
       } else {
-        replies.push(result.text);
+        replies.push(resultText);
       }
     } catch {
-      replies.push(result.text);
-    }
-  }
-
-  if (isFirstInteraction && !botUsedTool) {
-    const greetingAlreadyPresent = replies.some((replyText) => {
-      const lower = replyText?.toLowerCase() || '';
-      return lower.includes('benvenuto') || lower.includes('hola') || lower.includes('saludo');
-    });
-    if (!greetingAlreadyPresent) {
-      replies.unshift(WELCOME_MESSAGE);
+      replies.push(resultText);
     }
   }
 
@@ -546,8 +705,8 @@ ${debugInfo}
     const session = await sessionManager.getSession(phone);
     session.history.push(
       { role: 'user' as const, parts: [{ text }], timestamp: Date.now() },
-      ...(result.text
-        ? [{ role: 'assistant' as const, parts: [{ text: result.text }], timestamp: Date.now() }]
+      ...(resultText
+        ? [{ role: 'assistant' as const, parts: [{ text: resultText }], timestamp: Date.now() }]
         : [])
     );
     await sessionManager.updateSession(phone, session);

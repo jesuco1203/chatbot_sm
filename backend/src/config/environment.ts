@@ -8,7 +8,9 @@ export interface EnvConfig {
   metaAppSecret: string;
   databaseUrl: string;
   encryptionKey: string;
-  geminiApiKey: string;
+  deepseekApiKey: string;
+  deepseekModel: string;
+  deepseekBaseUrl?: string;
   restaurantLatitude: number;
   restaurantLongitude: number;
   deliveryRatePerKm: number;
@@ -40,7 +42,9 @@ export const loadEnv = (): EnvConfig => {
     metaAppSecret: get('META_APP_SECRET'),
     databaseUrl: get('DATABASE_URL'),
     encryptionKey: get('PHONE_ENCRYPTION_KEY'),
-    geminiApiKey: get('GEMINI_API_KEY'),
+    deepseekApiKey: get('DEEPSEEK_API_KEY'),
+    deepseekModel: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
+    deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
     restaurantLatitude: getNumber('RESTAURANT_LATITUDE'),
     restaurantLongitude: getNumber('RESTAURANT_LONGITUDE'),
     deliveryRatePerKm: getNumber('DELIVERY_RATE_PER_KM')

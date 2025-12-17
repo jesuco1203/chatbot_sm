@@ -45,7 +45,9 @@ WHATSAPP_VERIFY_TOKEN=tu_token_verificacion
 WHATSAPP_ACCESS_TOKEN=tu_token_acceso_permanente
 WHATSAPP_PHONE_ID=id_telefono_whatsapp
 # Google Gemini
-GEMINI_API_KEY=tu_api_key_google
+DEEPSEEK_API_KEY=tu_api_key_deepseek
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com
 # Base de Datos
 DATABASE_URL=postgresql://user:pass@host:5432/db_name?sslmode=disable
 # Seguridad (Opcional)

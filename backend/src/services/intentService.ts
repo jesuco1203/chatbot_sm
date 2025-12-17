@@ -1,4 +1,3 @@
-import { GoogleGenAI } from '@google/genai';
 import { loadEnv } from '../config/environment';
 import { ConversationContext } from './conversationService';
 import {
@@ -11,9 +10,9 @@ import {
   ConfirmOrderIntent
 } from '../types/intents';
 import { detectCategoryFromText } from './productSearch';
+import { deepseekClient, defaultDeepseekModel } from '../llm/deepseekClient';
 
 const env = loadEnv();
-const client = new GoogleGenAI({ apiKey: env.geminiApiKey });
 
 const GREETING_KEYWORDS = ['hola', 'holaa', 'hola!', 'hello', 'hi', 'buenas', 'buenos dias', 'buenos días', 'buenas tardes', 'buenas noches'];
 const MENU_KEYWORDS = ['menu', 'menú', 'carta', 'ver menu', 'ver carta', 'categorias', 'categorías'];
@@ -141,15 +140,23 @@ ${JSON.stringify(cart)}
 `;
 
   try {
-    const result = await client.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }]
+    const completion = await deepseekClient.chat.completions.create({
+      model: defaultDeepseekModel,
+      messages: [
+        { role: 'system', content: 'Eres un asistente de pedidos de una pizzería en WhatsApp.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 300
     });
 
-    const responseAny = (result as any).response;
-    const responseText =
-      (typeof responseAny?.text === 'function' && responseAny.text()) ||
-      responseAny?.candidates?.[0]?.content?.parts?.map((part: any) => part.text ?? '').join('');
+    const content: any = completion.choices[0]?.message?.content;
+    const responseText = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content.map((c: any) => (typeof c === 'string' ? c : c.text ?? '')).join('')
+        : '';
+
     if (!responseText) throw new Error('Empty response');
 
     const json = extractJson(responseText);

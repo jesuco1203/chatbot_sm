@@ -67,11 +67,18 @@ export const webhook = async (req: Request, res: Response) => {
         console.log(`│ 📥 INCOMING MESSAGE                              │`);
         console.log(`│ 👤 De:      ${String(message?.from).padEnd(29)}│`);
         console.log(`│ 📨 Tipo:    ${inputSource.padEnd(29)}│`);
-        console.log(`│ 📄 Texto:   ${(content || '').substring(0, 29).padEnd(29)}│`);
+        const contentLine = content || '';
+        console.log(`│ 📄 Texto:   ${contentLine.substring(0, 29).padEnd(29)}│`);
         if (rawId) {
         console.log(`│ 🆔 Payload: ${rawId.substring(0, 29).padEnd(29)}│`);
         }
         console.log('╰──────────────────────────────────────────────────╯\n');
+        if (contentLine.length > 29) {
+          console.log(`💬 Texto completo: ${contentLine}`);
+        }
+        if (rawId && rawId.length > 29) {
+          console.log(`💬 Payload completo: ${rawId}`);
+        }
 
         if (message?.id) {
           if (processedMessages.has(message.id)) {
