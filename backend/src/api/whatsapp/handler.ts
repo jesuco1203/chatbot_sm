@@ -386,6 +386,10 @@ export const handleIncoming = async (message: IncomingMessage): Promise<void> =>
       session.waitingForName = false;
       sessionDirty = true;
       await persistSession();
+      if ((session.orderAddress || session.address) && session.delivery && session.cart.length > 0) {
+        sessionDirty = (await sendCheckoutSummary(message.from, session)) || sessionDirty;
+        return;
+      }
     } else {
       await send({
         to: message.from,
@@ -876,7 +880,8 @@ export const handleIncoming = async (message: IncomingMessage): Promise<void> =>
     return;
   }
 
-  if (['go_checkout', 'finalizar compra', 'checkout', 'listo', 'eso es todo', 'nada mas', 'nada más', 'ya termine', 'ya terminé'].includes(normalizedInput)) {
+  const checkoutRegex = /(es\s*tod[oa]?|eso\s*es\s*todo|nada\s*m[aá]s|ya\s*termin[eé]|finalizar|checkout|pagar|s\s*tod)/i;
+  if (['go_checkout', 'finalizar compra', 'checkout', 'listo', 'eso es todo', 'nada mas', 'nada más', 'ya termine', 'ya terminé'].includes(normalizedInput) || checkoutRegex.test(rawText || '')) {
     sessionDirty = (await sendCheckoutSummary(message.from, session)) || sessionDirty;
     return;
   }
